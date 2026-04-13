@@ -13,14 +13,17 @@ import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_DEBUG from "./prompt/debug.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_ASK from "./prompt/ask.txt"
-import PROMPT_ORCHESTRATOR from "./prompt/orchestrator.txt"
+import PROMPT_FARMER from "./prompt/farmer.txt"
+
 import PROMPT_SUMMARY from "./prompt/summary.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
+import PROMPT_SCOUT from "./prompt/scout.txt" // kilocode_change
+import PROMPT_PLAN from "./prompt/plan.txt" // kilocode_change
 
 import { PermissionNext } from "@/permission/next"
 import { NamedError } from "@opencode-ai/util/error" // kilocode_change
 import { Glob } from "../util/glob" // kilocode_change
-import { mergeDeep, pipe, sortBy, values } from "remeda"
+import { mergeDeep, values } from "remeda"
 import { Global } from "@/global"
 import path from "path"
 import { Plugin } from "@/plugin"
@@ -209,6 +212,7 @@ export namespace Agent {
       code: {
         name: "code",
         description: "The default agent. Executes tools based on configured permissions.",
+        color: "#F59E0B", // kilocode_change
         // kilocode_change end
         options: {},
         permission: PermissionNext.merge(
@@ -225,6 +229,8 @@ export namespace Agent {
       plan: {
         name: "plan",
         description: "Plan mode. Only allows editing plan files; asks before editing anything else.",
+        color: "#64748B", // kilocode_change
+        prompt: PROMPT_PLAN, // kilocode_change
         options: {},
         permission: PermissionNext.merge(
           defaults,
@@ -246,12 +252,14 @@ export namespace Agent {
           user,
         ),
         mode: "primary",
+        hidden: true, // kilocode_change - keep plan workflow without showing it in the picker
         native: true,
       },
-      // kilocode_change start - add debug, orchestrator, and ask agents
+      // kilocode_change start - add debug and ask agents
       debug: {
         name: "debug",
         description: "Diagnose and fix software issues with systematic debugging methodology.",
+        color: "#EF4444", // kilocode_change
         prompt: PROMPT_DEBUG,
         options: {},
         permission: PermissionNext.merge(
@@ -265,46 +273,11 @@ export namespace Agent {
         mode: "primary",
         native: true,
       },
-      orchestrator: {
-        name: "orchestrator",
-        description: "Coordinate complex tasks by delegating to specialized agents in parallel.",
-        prompt: PROMPT_ORCHESTRATOR,
-        options: {},
-        permission: PermissionNext.merge(
-          defaults,
-          PermissionNext.fromConfig({
-            "*": "deny",
-            read: "allow",
-            grep: "allow",
-            glob: "allow",
-            list: "allow",
-            // bash: "allow", // kilocode_change - disabled to prevent orchestrator from writing files via shell commands instead of delegating to sub-agents
-            question: "allow",
-            task: "allow",
-            todoread: "allow",
-            todowrite: "allow",
-            webfetch: "allow",
-            websearch: "allow",
-            codesearch: "allow",
-            codebase_search: "allow", // kilocode_change
-            external_directory: {
-              [Truncate.GLOB]: "allow",
-            },
-          }),
-          user,
-          // kilocode_change start - enforce bash deny after user so user config cannot re-enable shell
-          PermissionNext.fromConfig({
-            bash: "deny",
-          }),
-          // kilocode_change end
-        ),
-        mode: "primary",
-        native: true,
-        deprecated: true,
-      },
+
       ask: {
         name: "ask",
         description: "Get answers and explanations without making changes to the codebase.",
+        color: "#3B82F6", // kilocode_change
         prompt: PROMPT_ASK,
         options: {},
         permission: PermissionNext.merge(
@@ -337,7 +310,65 @@ export namespace Agent {
         mode: "primary",
         native: true,
       },
+      farmer: {
+        name: "farmer",
+        description:
+          "Expert in precision agriculture, agronomy, crop science, soil management, and sustainable farming practices.",
+        color: "#22C55E", // kilocode_change
+        prompt: PROMPT_FARMER,
+        options: {},
+        permission: PermissionNext.merge(
+          defaults,
+          PermissionNext.fromConfig({
+            question: "allow",
+            plan_enter: "allow",
+          }),
+          user,
+        ),
+        mode: "primary",
+        native: true,
+      },
       // kilocode_change end
+
+      // kilocode_change start - scout: lightweight read-only analyst (cheap/fast model)
+      scout: {
+        name: "scout",
+        description:
+          "Fast, lightweight code analyst for scanning, describing, and triaging codebases. Optimized for cheap/fast models.",
+        color: "#14B8A6", // kilocode_change
+        prompt: PROMPT_SCOUT,
+        options: {},
+        permission: PermissionNext.merge(
+          defaults,
+          user,
+          PermissionNext.fromConfig({
+            "*": "deny",
+            bash: readOnlyBash,
+            read: {
+              "*": "allow",
+              "*.env": "ask",
+              "*.env.*": "ask",
+              "*.env.example": "allow",
+            },
+            grep: "allow",
+            glob: "allow",
+            list: "allow",
+            question: "allow",
+            webfetch: "allow",
+            websearch: "allow",
+            codesearch: "allow",
+            codebase_search: "allow",
+            external_directory: {
+              [Truncate.GLOB]: "allow",
+            },
+            ...mcpRules,
+          }),
+          user.filter((r) => r.action === "deny"),
+        ),
+        mode: "primary",
+        native: true,
+      },
+
       general: {
         name: "general",
         description: `General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.`,
@@ -499,11 +530,24 @@ export namespace Agent {
 
   export async function list() {
     const cfg = await Config.get()
-    return pipe(
-      await state(),
-      values(),
-      sortBy([(x) => (cfg.default_agent ? x.name === cfg.default_agent : x.name === "code"), "desc"]), // kilocode_change - renamed from "build" to "code"
-    )
+    const agents = values(await state())
+    const def = cfg.default_agent === "build" ? "code" : (cfg.default_agent ?? "ask")
+    const order: Record<string, number> = {
+      ask: 0,
+      scout: 1,
+      code: 2,
+      debug: 3,
+      farmer: 4,
+    }
+    return agents.sort((a, b) => {
+      const aDef = a.name === def
+      const bDef = b.name === def
+      if (aDef !== bDef) return aDef ? -1 : 1
+      const aOrd = order[a.name] ?? 100
+      const bOrd = order[b.name] ?? 100
+      if (aOrd !== bOrd) return aOrd - bOrd
+      return a.name.localeCompare(b.name)
+    })
   }
 
   export async function defaultAgent() {
@@ -521,7 +565,11 @@ export namespace Agent {
       return agent.name
     }
 
-    const primaryVisible = Object.values(agents).find((a) => a.mode !== "subagent" && a.hidden !== true)
+    const primaryVisible =
+      ["ask", "scout", "code", "debug", "farmer"]
+        .map((name) => agents[name])
+        .find((a): a is Info => !!a && a.mode !== "subagent" && a.hidden !== true) ??
+      Object.values(agents).find((a) => a.mode !== "subagent" && a.hidden !== true)
     if (!primaryVisible) throw new Error("no primary visible agent found")
     return primaryVisible.name
   }

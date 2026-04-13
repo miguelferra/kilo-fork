@@ -72,6 +72,7 @@ export namespace LLM {
     const isCodex = provider.id === "openai" && auth?.type === "oauth"
 
     const system = []
+
     system.push(
       [
         // kilocode_change start - soul defines core identity and personality

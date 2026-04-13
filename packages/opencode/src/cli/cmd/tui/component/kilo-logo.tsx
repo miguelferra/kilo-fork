@@ -9,12 +9,7 @@ import { useTheme, tint } from "@tui/context/theme"
 // ~ = shadow top only (▀ with fg=shadow)
 const SHADOW_MARKER = /[_^~]/
 
-const ASCII_LOGO = [
-  `██ ▄█▀ ██ ██     ▄████▄   ▄█████ ██     ██ `,
-  `████   ██ ██     ██~~██   ██~~~~ ██     ██ `,
-  `██ ▀█▄ ██ ██████ ▀████▀   ▀█████ ██████ ██ `,
-  `~~  ~~ ~~ ~~~~~~  ~~~~     ~~~~~ ~~~~~~ ~~ `,
-]
+const ASCII_LOGO = [`████▄  ▄████▄  █████▄  ▄████▄ `, `████▀    ▄█▀   ██  ██    ▄█▀  `, `██ ▀█▄ ██████  █████▀  ██████`]
 
 export function KiloLogo() {
   const { theme } = useTheme()

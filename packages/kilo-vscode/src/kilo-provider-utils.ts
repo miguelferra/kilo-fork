@@ -83,7 +83,7 @@ export function indexProvidersById(all: ProviderInfo[]): Record<string, Provider
 
 export function filterVisibleAgents(agents: Agent[]): { visible: Agent[]; defaultAgent: string } {
   const visible = agents.filter((a) => a.mode !== "subagent" && !a.hidden)
-  const defaultAgent = visible.length > 0 ? visible[0]!.name : "code"
+  const defaultAgent = visible.length > 0 ? visible[0]!.name : "ask"
   return { visible, defaultAgent }
 }
 

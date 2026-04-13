@@ -1187,7 +1187,7 @@ export namespace Config {
         .string()
         .optional()
         .describe(
-          "Default agent to use when none is specified. Must be a primary agent. Falls back to 'code' if not set or if the specified agent is invalid.",
+          "Default agent to use when none is specified. Must be a primary agent. Falls back to 'ask' if not set or if the specified agent is invalid.",
         ),
       // kilocode_change end
       username: z

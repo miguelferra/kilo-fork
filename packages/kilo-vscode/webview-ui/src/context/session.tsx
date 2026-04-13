@@ -255,7 +255,7 @@ export const SessionProvider: ParentComponent = (props) => {
 
   // Agents (modes) loaded from the CLI backend
   const [agents, setAgents] = createSignal<AgentInfo[]>([])
-  const [defaultAgent, setDefaultAgent] = createSignal("code")
+  const [defaultAgent, setDefaultAgent] = createSignal("ask")
 
   // Skills loaded from the CLI backend
   const [skills, setSkills] = createSignal<SkillInfo[]>([])
