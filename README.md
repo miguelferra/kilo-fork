@@ -25,6 +25,33 @@
 - [VS Code Marketplace](https://kilo.ai/vscode-marketplace?utm_source=Readme) (download)
 - Install CLI: `npm install -g @kilocode/cli`
 - [Official Kilo.ai Home page](https://kilo.ai) (learn more)
+- [This fork on GitHub](https://github.com/miguelferra/kilo-fork)
+
+## Personal Fork Workflow
+
+This fork is configured for personal development and multi-device use.
+
+- **Fork remote** (`origin`): `https://github.com/miguelferra/kilo-fork.git`
+- **Upstream remote** (`upstream`): `https://github.com/Kilo-Org/kilocode.git`
+- Keep `main` synced from upstream and push your custom changes to your fork.
+
+```bash
+# one-time setup (if needed)
+git remote rename origin upstream
+git remote add origin https://github.com/miguelferra/kilo-fork.git
+
+# keep your fork current
+git fetch upstream
+git checkout main
+git rebase upstream/main
+git push origin main
+```
+
+### Multi-device Sync
+
+- Clone your fork on each machine and sign in with the same GitHub account.
+- Use `kilo remote` (or set `"remote_control": true` in config) for real-time session relay.
+- Use `kilo export` and `kilo import` for manual session transfer between devices.
 
 ## Key Features
 
