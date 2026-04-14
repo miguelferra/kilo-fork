@@ -53,6 +53,14 @@ git push origin main
 - Use `kilo remote` (or set `"remote_control": true` in config) for real-time session relay.
 - Use `kilo export` and `kilo import` for manual session transfer between devices.
 
+### Install This Fork CLI (One Line)
+
+Install the latest release binary from this fork as `cli` on Linux x64:
+
+```bash
+mkdir -p "$HOME/.local/bin" && curl -fL "https://github.com/miguelferra/kilo-fork/releases/download/v0.1.0-fork/cli-linux-x64.tar.gz" | tar -xzO cli > "$HOME/.local/bin/cli" && chmod +x "$HOME/.local/bin/cli" && "$HOME/.local/bin/cli" --version
+```
+
 ## Key Features
 
 - **Code Generation:** Kilo can generate code using natural language.
