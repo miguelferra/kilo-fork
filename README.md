@@ -4,12 +4,12 @@ Personal fork workspace for my CLI setup, releases, and multi-device workflow.
 
 ## Repo setup
 
-- Fork remote (`origin`): `https://github.com/miguelferra/kilo-fork.git`
+- Fork remote (`origin`): `https://github.com/<your-github-username>/kilo-fork.git`
 - Upstream remote (`upstream`): `https://github.com/Kilo-Org/kilocode.git`
 
 ```bash
 git remote rename origin upstream
-git remote add origin https://github.com/miguelferra/kilo-fork.git
+git remote add origin https://github.com/<your-github-username>/kilo-fork.git
 ```
 
 ## Keep fork in sync
@@ -45,13 +45,13 @@ mkdir -p /tmp/kilo-release && cp packages/opencode/dist/@kilocode/cli-linux-x64/
 ```
 
 ```bash
-gh release create v0.1.0-fork --repo miguelferra/kilo-fork --title "v0.1.0-fork" --notes "Fork CLI build" || true; gh release upload v0.1.0-fork /tmp/cli-linux-x64.tar.gz --repo miguelferra/kilo-fork --clobber
+gh release create v0.1.0-fork --repo <your-github-username>/kilo-fork --title "v0.1.0-fork" --notes "Fork CLI build" || true; gh release upload v0.1.0-fork /tmp/cli-linux-x64.tar.gz --repo <your-github-username>/kilo-fork --clobber
 ```
 
 ## Install on another Linux x64 machine (one line)
 
 ```bash
-mkdir -p "$HOME/.local/bin" && curl -fL "https://github.com/miguelferra/kilo-fork/releases/download/v0.1.0-fork/cli-linux-x64.tar.gz" | tar -xzO cli > "$HOME/.local/bin/cli" && chmod +x "$HOME/.local/bin/cli" && "$HOME/.local/bin/cli" --version
+mkdir -p "$HOME/.local/bin" && curl -fL "https://github.com/<your-github-username>/kilo-fork/releases/download/v0.1.0-fork/cli-linux-x64.tar.gz" | tar -xzO cli > "$HOME/.local/bin/cli" && chmod +x "$HOME/.local/bin/cli" && "$HOME/.local/bin/cli" --version
 ```
 
 Optional PATH persistence:
