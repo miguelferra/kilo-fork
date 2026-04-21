@@ -18,6 +18,8 @@ import { iife } from "@/util/iife"
 import { Global } from "../global"
 import path from "path"
 import { Filesystem } from "../util/filesystem"
+import { Glob } from "../util/glob"
+import { which } from "../util/which"
 
 // Direct imports for bundled providers
 import { createAmazonBedrock, type AmazonBedrockProviderSettings } from "@ai-sdk/amazon-bedrock"
@@ -30,6 +32,8 @@ import { createOpenAI } from "@ai-sdk/openai"
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
 import { createOpenRouter, type LanguageModelV2 } from "@openrouter/ai-sdk-provider"
 import { createOpenaiCompatible as createGitHubCopilotOpenAICompatible } from "./sdk/copilot"
+import { createGeminiCli } from "@/kilocode/provider/gemini-cli" // kilocode_change
+import { createClaudeCli } from "@/kilocode/provider/claude-cli" // kilocode_change
 import { createKilo, type KiloProvider } from "@kilocode/kilo-gateway" // kilocode_change
 import { createXai } from "@ai-sdk/xai"
 import { createMistral } from "@ai-sdk/mistral"
@@ -88,6 +92,39 @@ export namespace Provider {
     })
   }
 
+  async function resolveLocalCommand(command: string) {
+    if (!command) return null
+
+    const direct = which(command) ?? Bun.which(command)
+    if (direct) return direct
+
+    if (path.isAbsolute(command) || command.includes(path.sep)) {
+      return (await Filesystem.exists(command)) ? command : null
+    }
+
+    const homeCandidates = [
+      path.join(Global.Path.home, ".local", "bin", command),
+      path.join(Global.Path.home, ".bun", "bin", command),
+    ]
+    for (const candidate of homeCandidates) {
+      if (await Filesystem.exists(candidate)) return candidate
+    }
+
+    const nvmRoot = path.join(Global.Path.home, ".nvm", "versions", "node")
+    if (await Filesystem.isDir(nvmRoot)) {
+      const matches = await Glob.scan(`*/bin/${command}`, {
+        cwd: nvmRoot,
+        absolute: true,
+        include: "file",
+        symlink: true,
+      }).catch(() => [])
+      const resolved = matches.sort().at(-1)
+      if (resolved) return resolved
+    }
+
+    return null
+  }
+
   const BUNDLED_PROVIDERS: Record<string, (options: any) => SDK> = {
     "@ai-sdk/amazon-bedrock": createAmazonBedrock,
     "@ai-sdk/anthropic": createAnthropic,
@@ -98,6 +135,8 @@ export namespace Provider {
     "@ai-sdk/openai": createOpenAI,
     "@ai-sdk/openai-compatible": createOpenAICompatible,
     "@openrouter/ai-sdk-provider": createOpenRouter,
+    "@opencode-ai/gemini-cli": createGeminiCli,
+    "@kilocode/claude-cli": createClaudeCli, // kilocode_change
     "@kilocode/kilo-gateway": createKilo, // kilocode_change
     "@ai-sdk/xai": createXai,
     "@ai-sdk/mistral": createMistral,
@@ -350,6 +389,56 @@ export namespace Provider {
         },
       }
     },
+    "gemini-cli": async (input) => {
+      const commands = Array.from(new Set([input.options?.command, "gemini", "gemini-cli"].filter(Boolean)))
+      for (const command of commands) {
+        const resolved = await resolveLocalCommand(command)
+        if (!resolved) continue
+        return {
+          autoload: true,
+          options: {
+            command: resolved,
+            extraArgs: input.options?.extraArgs, // kilocode_change
+          },
+        }
+      }
+
+      const command = input.options?.command ?? "gemini"
+      return {
+        autoload: false,
+        options: {
+          command,
+          extraArgs: input.options?.extraArgs, // kilocode_change
+        },
+      }
+    },
+    // kilocode_change start
+    "claude-cli": async (input) => {
+      const commands = Array.from(new Set([input.options?.command, "claude", "claude-code"].filter(Boolean)))
+      for (const command of commands) {
+        const resolved = await resolveLocalCommand(command)
+        if (!resolved) continue
+        return {
+          autoload: true,
+          options: {
+            command: resolved,
+            permissionMode: input.options?.permissionMode,
+            extraArgs: input.options?.extraArgs,
+          },
+        }
+      }
+
+      const command = input.options?.command ?? "claude"
+      return {
+        autoload: false,
+        options: {
+          command,
+          permissionMode: input.options?.permissionMode,
+          extraArgs: input.options?.extraArgs,
+        },
+      }
+    },
+    // kilocode_change end
     vercel: async () => {
       return {
         autoload: false,

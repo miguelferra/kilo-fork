@@ -37,6 +37,13 @@ export const AiSdkProvider = z.enum(AI_SDK_PROVIDERS)
 export namespace ModelsDev {
   const log = Log.create({ service: "models.dev" })
   const filepath = path.join(Global.Path.cache, "models.json")
+  const GEMINI_CLI_MODELS = [
+    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+  ] as const
 
   export const Model = z.object({
     id: z.string(),
@@ -137,6 +144,93 @@ export namespace ModelsDev {
     if (providers["kilo"]) {
       delete providers["kilo"]
     }
+
+    if (!providers["gemini-cli"] && providers["google"]) {
+      const google = providers["google"]
+      const googleModels = google.models
+      const fallbackSources: Record<(typeof GEMINI_CLI_MODELS)[number], string[]> = {
+        "gemini-3.1-pro-preview": ["gemini-3.1-pro-preview", "gemini-3-pro-preview"],
+        "gemini-3-flash-preview": ["gemini-3-flash-preview"],
+        "gemini-2.5-pro": ["gemini-2.5-pro"],
+        "gemini-2.5-flash": ["gemini-2.5-flash"],
+        "gemini-2.5-flash-lite": ["gemini-2.5-flash-lite", "gemini-2.5-flash-lite-preview-09-2025"],
+      }
+      const models = Object.fromEntries(
+        GEMINI_CLI_MODELS.flatMap((id, index) => {
+          const sourceID = fallbackSources[id].find((candidate) => googleModels[candidate])
+          const source = sourceID ? googleModels[sourceID] : undefined
+          if (!source) return []
+
+          return [
+            [
+              id,
+              {
+                ...source,
+                id,
+                name: id,
+                attachment: false,
+                tool_call: false,
+                modalities: {
+                  input: ["text"] as Array<"audio" | "image" | "pdf" | "text" | "video">,
+                  output: ["text"] as Array<"audio" | "image" | "pdf" | "text" | "video">,
+                },
+                provider: {
+                  npm: "@opencode-ai/gemini-cli",
+                  api: "gemini://local",
+                },
+                prompt: source.prompt ?? "gemini",
+                recommendedIndex: index,
+              },
+            ] as const,
+          ]
+        }),
+      )
+
+      providers["gemini-cli"] = {
+        id: "gemini-cli",
+        name: "Gemini CLI",
+        env: [],
+        api: "gemini://local",
+        npm: "@opencode-ai/gemini-cli",
+        models,
+      }
+    }
+
+    // kilocode_change start
+    if (!providers["claude-cli"] && providers["anthropic"]) {
+      const anthropic = providers["anthropic"]
+      const claudeModels = Object.fromEntries(
+        Object.entries(anthropic.models).map(([id, source], index) => [
+          id,
+          {
+            ...source,
+            id,
+            attachment: false,
+            tool_call: false,
+            modalities: {
+              input: ["text"] as Array<"audio" | "image" | "pdf" | "text" | "video">,
+              output: ["text"] as Array<"audio" | "image" | "pdf" | "text" | "video">,
+            },
+            provider: {
+              npm: "@kilocode/claude-cli",
+              api: "claude://local",
+            },
+            prompt: source.prompt ?? "anthropic",
+            recommendedIndex: source.recommendedIndex ?? index,
+          },
+        ]),
+      )
+
+      providers["claude-cli"] = {
+        id: "claude-cli",
+        name: "Claude CLI",
+        env: [],
+        api: "claude://local",
+        npm: "@kilocode/claude-cli",
+        models: claudeModels,
+      }
+    }
+    // kilocode_change end
 
     // Inject kilo provider with dynamic model fetching
     // Skip injection entirely when enabled_providers is set and doesn't include "kilo",
