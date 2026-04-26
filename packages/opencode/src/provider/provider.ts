@@ -399,6 +399,8 @@ export namespace Provider {
           options: {
             command: resolved,
             extraArgs: input.options?.extraArgs, // kilocode_change
+            approvalMode: input.options?.approvalMode, // kilocode_change
+            transport: input.options?.transport, // kilocode_change
           },
         }
       }
@@ -409,6 +411,8 @@ export namespace Provider {
         options: {
           command,
           extraArgs: input.options?.extraArgs, // kilocode_change
+          approvalMode: input.options?.approvalMode, // kilocode_change
+          transport: input.options?.transport, // kilocode_change
         },
       }
     },

@@ -7,18 +7,38 @@ import {
   type LanguageModelV2StreamPart,
   type SharedV2ProviderMetadata,
 } from "@ai-sdk/provider"
+import {
+  createTurnPush,
+  drainStderr,
+  isRecord,
+  readNdjson,
+  serializeMessage,
+  serializePrompt,
+  stringifyUnknown,
+  stripFlags,
+  type TurnPush,
+} from "./_cli-shared"
 
-// Stateless LanguageModelV2 wrapper around the `claude` CLI.
+// LanguageModelV2 wrapper around the local `claude` CLI.
 //
-// v1 design: spawn fresh per request, drop CLI-internal tool_use/tool_result
-// as executable tool calls (fold into reasoning for visibility), surface only
-// text + reasoning to Kilo. Auth is whatever the local `claude` binary uses.
+// Two modes:
+//   1) Persistent session (v2) — when the call carries an x-kilo-session
+//      header, one long-lived `claude --input-format stream-json` process
+//      is kept per (sessionID, modelID). First turn sends the full
+//      flattened context. Subsequent turns send ONLY the new user (and
+//      tool) messages so Claude's own prompt cache does the heavy lifting.
+//   2) Stateless fallback (v1) — when no sessionID header is present,
+//      spawn a fresh `claude -p <prompt>` per call.
+//
+// In both modes we surface text + thinking, fold CLI-internal tool_use
+// and tool_result into reasoning, and never execute them as Kilo tools.
 
 export interface ClaudeCliProviderSettings {
   name?: string
   command?: string
   permissionMode?: string
   extraArgs?: string[]
+  persistent?: boolean
 }
 
 export interface ClaudeCliProvider {
@@ -35,7 +55,7 @@ type ClaudeUsage = {
   cache_creation_input_tokens?: number
 }
 
-type ClaudeContentBlock =
+type ClaudeBlock =
   | { type: "text"; text?: string }
   | { type: "thinking"; thinking?: string; text?: string }
   | { type: "tool_use"; id?: string; name?: string; input?: unknown }
@@ -44,118 +64,25 @@ type ClaudeContentBlock =
 
 type ClaudeEvent =
   | { type: "system"; subtype?: string; [key: string]: unknown }
-  | {
-      type: "assistant"
-      message?: { id?: string; content?: ClaudeContentBlock[]; usage?: ClaudeUsage }
-    }
-  | {
-      type: "user"
-      message?: { content?: ClaudeContentBlock[] | string }
-    }
-  | {
-      type: "result"
-      subtype?: string
-      usage?: ClaudeUsage
-      result?: string
-      is_error?: boolean
-      [key: string]: unknown
-    }
+  | { type: "assistant"; message?: { id?: string; content?: ClaudeBlock[]; usage?: ClaudeUsage } }
+  | { type: "user"; message?: { content?: ClaudeBlock[] | string } }
+  | { type: "result"; subtype?: string; usage?: ClaudeUsage; result?: string; is_error?: boolean }
   | { type: string; [key: string]: unknown }
 
-function stringifyUnknown(input: unknown): string {
-  if (typeof input === "string") return input
-  if (input instanceof Error) return input.message
-  if (input && typeof input === "object" && "message" in input && typeof input.message === "string") {
-    return input.message
-  }
-  try {
-    return JSON.stringify(input)
-  } catch {
-    return String(input)
-  }
+type TurnResult = {
+  finish: LanguageModelV2FinishReason
+  usage: ReturnType<typeof mapUsage>
 }
 
-function formatToolOutput(output: {
-  type: "text" | "error-text" | "json" | "error-json" | "content"
-  value: unknown
-}) {
-  switch (output.type) {
-    case "text":
-    case "error-text":
-      return String(output.value)
-    case "json":
-    case "error-json":
-    case "content":
-      return stringifyUnknown(output.value)
-  }
-}
-
-function formatAssistantContent(parts: Array<{ type: string; [key: string]: unknown }>) {
-  const lines: string[] = []
-  for (const part of parts) {
-    switch (part.type) {
-      case "text":
-        if (typeof part.text === "string" && part.text.trim()) lines.push(part.text)
-        break
-      case "reasoning":
-        if (typeof part.text === "string" && part.text.trim()) lines.push(`[Reasoning]\n${part.text}`)
-        break
-      case "tool-call":
-        lines.push(`[Tool ${String(part.toolName ?? "unknown")}] ${stringifyUnknown(part.input)}`)
-        break
-    }
-  }
-  return lines.join("\n\n").trim()
-}
-
-function serializePrompt(prompt: LanguageModelV2Prompt) {
+function serializeDelta(prompt: LanguageModelV2Prompt, sentCount: number): string {
+  const slice = prompt.slice(sentCount)
   const blocks: string[] = []
-
-  for (const message of prompt) {
-    switch (message.role) {
-      case "system":
-        if (message.content.trim()) blocks.push(`System:\n${message.content}`)
-        break
-
-      case "user": {
-        const content = message.content
-          .map((part) => {
-            switch (part.type) {
-              case "text":
-                return part.text
-              case "file":
-                return `[Attachment omitted: ${part.filename ?? part.mediaType}]`
-            }
-          })
-          .filter((item) => item.trim())
-          .join("\n")
-
-        if (content) blocks.push(`User:\n${content}`)
-        break
-      }
-
-      case "assistant": {
-        const content = formatAssistantContent(
-          message.content as unknown as Array<{ type: string; [key: string]: unknown }>,
-        )
-        if (content) blocks.push(`Assistant:\n${content}`)
-        break
-      }
-
-      case "tool": {
-        const content = message.content
-          .map((part) => {
-            const body = formatToolOutput(part.output)
-            return `Tool ${part.toolName} (${part.toolCallId}):\n${body}`
-          })
-          .join("\n\n")
-
-        if (content) blocks.push(content)
-        break
-      }
-    }
+  for (const message of slice) {
+    // skip system (stable across turns) and assistant (Claude remembers its own output)
+    if (message.role === "system" || message.role === "assistant") continue
+    const chunk = serializeMessage(message)
+    if (chunk) blocks.push(chunk)
   }
-
   return blocks.join("\n\n")
 }
 
@@ -188,11 +115,7 @@ function mapUsage(usage: ClaudeUsage | undefined) {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
-
-function formatToolUse(block: ClaudeContentBlock): string {
+function formatToolUse(block: ClaudeBlock): string {
   if (block.type !== "tool_use") return ""
   const name = typeof block.name === "string" ? block.name : "unknown"
   const input = block.input !== undefined ? stringifyUnknown(block.input) : ""
@@ -200,13 +123,308 @@ function formatToolUse(block: ClaudeContentBlock): string {
   return `[Tool ${name}]${suffix}`
 }
 
-function formatToolResult(block: ClaudeContentBlock): string {
+function formatToolResult(block: ClaudeBlock): string {
   if (block.type !== "tool_result") return ""
   const id = typeof block.tool_use_id === "string" ? block.tool_use_id : "?"
   const body = block.content !== undefined ? stringifyUnknown(block.content) : ""
   const prefix = block.is_error ? "Tool error" : "Tool result"
   return body ? `[${prefix} ${id}]\n${body}` : `[${prefix} ${id}]`
 }
+
+function handleAssistantBlocks(blocks: ClaudeBlock[] | undefined, push: TurnPush) {
+  if (!blocks) return
+  for (const block of blocks) {
+    switch (block.type) {
+      case "text":
+        if (typeof block.text === "string") push.pushText(block.text)
+        break
+      case "thinking": {
+        const thought = typeof block.thinking === "string" ? block.thinking : block.text
+        if (typeof thought === "string") push.pushReasoning(thought)
+        break
+      }
+      case "tool_use": {
+        const formatted = formatToolUse(block)
+        if (formatted) push.pushReasoning(formatted)
+        break
+      }
+      case "tool_result": {
+        const formatted = formatToolResult(block)
+        if (formatted) push.pushReasoning(formatted)
+        break
+      }
+    }
+  }
+}
+
+function handleUserBlocks(content: ClaudeBlock[] | string | undefined, push: TurnPush) {
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (block.type !== "tool_result") continue
+    const formatted = formatToolResult(block)
+    if (formatted) push.pushReasoning(formatted)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent session manager
+// ---------------------------------------------------------------------------
+
+type SessionConfig = {
+  command: string
+  modelId: string
+  permissionMode: string
+  extraArgs: string[]
+}
+
+const IDLE_MS = 30 * 60 * 1000
+const SESSIONS = new Map<string, ClaudeSession>()
+let cleanupTimer: ReturnType<typeof setInterval> | null = null
+let exitHooked = false
+
+function ensureCleanup() {
+  if (!cleanupTimer) {
+    cleanupTimer = setInterval(() => {
+      const now = Date.now()
+      for (const [key, session] of SESSIONS) {
+        if (session.dead || now - session.activity > IDLE_MS) {
+          session.close()
+          SESSIONS.delete(key)
+        }
+      }
+    }, 60 * 1000)
+    cleanupTimer.unref?.()
+  }
+  if (!exitHooked) {
+    exitHooked = true
+    process.on("beforeExit", () => {
+      for (const session of SESSIONS.values()) session.close()
+      SESSIONS.clear()
+    })
+  }
+}
+
+function sessionKey(sessionId: string, modelId: string) {
+  return `${sessionId}::${modelId}`
+}
+
+class ClaudeSession {
+  private proc: ReturnType<typeof Bun.spawn> | null = null
+  private encoder = new TextEncoder()
+  private pending: ((event: ClaudeEvent) => void) | null = null
+  private readonly key: string
+  private readonly cfg: SessionConfig
+  sentCount = 0
+  activity = Date.now()
+  dead = false
+  ready = false
+  startupError: string | undefined
+
+  constructor(key: string, cfg: SessionConfig) {
+    this.key = key
+    this.cfg = cfg
+  }
+
+  async start() {
+    const args = [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--model",
+      this.cfg.modelId,
+      "--permission-mode",
+      this.cfg.permissionMode,
+      ...this.cfg.extraArgs,
+    ]
+    this.proc = Bun.spawn([this.cfg.command, ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "pipe",
+      env: { ...process.env, CLAUDE_CODE_DISABLE_IDE: "1" },
+    })
+
+    this.proc.exited.then((code) => {
+      this.dead = true
+      if (!this.ready) {
+        this.startupError = this.startupError ?? `claude CLI exited before ready (code ${code})`
+      }
+      if (this.pending) {
+        this.pending({ type: "result", subtype: "error_during_execution", is_error: true })
+        this.pending = null
+      }
+    })
+
+    drainStderr(this.proc.stderr as ReadableStream<Uint8Array>, (text) => {
+      if (!this.ready) this.startupError = text
+    })
+    this.readLoop()
+    await this.waitReady()
+  }
+
+  private async readLoop() {
+    if (!this.proc) return
+    try {
+      await readNdjson<ClaudeEvent>(
+        this.proc.stdout as ReadableStream<Uint8Array>,
+        (event) => this.dispatch(event),
+        { onParseError: () => "skip" },
+      )
+    } catch {
+      // process died mid-read
+    } finally {
+      this.dead = true
+      if (this.pending) {
+        this.pending({ type: "result", subtype: "error_during_execution", is_error: true })
+        this.pending = null
+      }
+    }
+  }
+
+  private dispatch(event: ClaudeEvent) {
+    if (event.type === "system" && "subtype" in event && event.subtype === "init") {
+      this.ready = true
+      return
+    }
+    if (this.pending) this.pending(event)
+  }
+
+  private async waitReady(timeoutMs = 30_000) {
+    const start = Date.now()
+    while (!this.ready && !this.dead && Date.now() - start < timeoutMs) {
+      await Bun.sleep(25)
+    }
+    if (this.ready) return
+    if (this.startupError) throw new Error(`claude CLI failed to start: ${this.startupError}`)
+    if (this.dead) throw new Error("claude CLI exited before emitting init event")
+    throw new Error("claude CLI did not become ready in time")
+  }
+
+  private writeLine(payload: object) {
+    if (!this.proc) throw new Error("claude session has no process")
+    const line = JSON.stringify(payload) + "\n"
+    const stdin = this.proc.stdin as import("bun").FileSink
+    stdin.write(this.encoder.encode(line))
+    stdin.flush()
+  }
+
+  async turn(
+    content: string,
+    push: TurnPush,
+    abort: AbortSignal | undefined,
+  ): Promise<TurnResult> {
+    this.activity = Date.now()
+    if (!this.ready) await this.waitReady()
+
+    return new Promise<TurnResult>((resolve) => {
+      let lastUsage: ClaudeUsage | undefined
+      let interrupted = false
+
+      const finalize = (result: TurnResult) => {
+        this.pending = null
+        abort?.removeEventListener("abort", onAbort)
+        this.activity = Date.now()
+        resolve(result)
+      }
+
+      const onAbort = () => {
+        interrupted = true
+        try {
+          this.proc?.kill("SIGINT")
+        } catch {
+          // best-effort; next turn will rebuild if process dies
+        }
+      }
+
+      this.pending = (event) => {
+        switch (event.type) {
+          case "assistant": {
+            const message = isRecord(event.message) ? event.message : undefined
+            handleAssistantBlocks(message?.content as ClaudeBlock[] | undefined, push)
+            const usage = (message?.usage ?? undefined) as ClaudeUsage | undefined
+            if (usage) lastUsage = usage
+            return
+          }
+          case "user": {
+            const message = isRecord(event.message) ? event.message : undefined
+            handleUserBlocks(message?.content as ClaudeBlock[] | string | undefined, push)
+            return
+          }
+          case "result": {
+            const result = event as Extract<ClaudeEvent, { type: "result" }>
+            const finish = interrupted
+              ? "stop"
+              : mapFinish(result.subtype, result.is_error)
+            const usage = mapUsage(result.usage ?? lastUsage)
+            finalize({ finish, usage })
+            return
+          }
+        }
+      }
+
+      if (abort) abort.addEventListener("abort", onAbort, { once: true })
+
+      try {
+        this.writeLine({ type: "user", message: { role: "user", content } })
+      } catch (err) {
+        this.dead = true
+        finalize({
+          finish: "error",
+          usage: mapUsage(undefined),
+        })
+      }
+    })
+  }
+
+  close() {
+    if (!this.proc) return
+    try {
+      ;(this.proc.stdin as import("bun").FileSink).end()
+    } catch {
+      // already closed
+    }
+    try {
+      this.proc.kill()
+    } catch {
+      // already dead
+    }
+    this.proc = null
+    this.dead = true
+    this.ready = false
+  }
+}
+
+async function getSession(sessionId: string, cfg: SessionConfig): Promise<ClaudeSession> {
+  ensureCleanup()
+  const key = sessionKey(sessionId, cfg.modelId)
+  const existing = SESSIONS.get(key)
+  if (existing && !existing.dead) return existing
+
+  // model switch within same Kilo session: close any stale session for this sessionId
+  for (const [k, s] of SESSIONS) {
+    if (k.startsWith(`${sessionId}::`)) {
+      s.close()
+      SESSIONS.delete(k)
+    }
+  }
+
+  const session = new ClaudeSession(key, cfg)
+  SESSIONS.set(key, session)
+  try {
+    await session.start()
+  } catch (err) {
+    SESSIONS.delete(key)
+    session.close()
+    throw err
+  }
+  return session
+}
+
+// ---------------------------------------------------------------------------
+// LanguageModelV2
+// ---------------------------------------------------------------------------
 
 class ClaudeCliLanguageModel implements LanguageModelV2 {
   readonly specificationVersion = "v2"
@@ -218,6 +436,7 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
     private readonly command: string,
     private readonly permissionMode: string,
     private readonly extraArgs: string[],
+    private readonly persistent: boolean,
   ) {}
 
   get provider(): string {
@@ -254,7 +473,6 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
-
       switch (value.type) {
         case "text-delta":
           text += value.delta
@@ -301,6 +519,87 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
   async doStream(
     options: Parameters<LanguageModelV2["doStream"]>[0],
   ): Promise<Awaited<ReturnType<LanguageModelV2["doStream"]>>> {
+    const sessionId = readSessionId(options.headers)
+    if (this.persistent && sessionId) {
+      return this.doStreamPersistent(options, sessionId)
+    }
+    return this.doStreamStateless(options)
+  }
+
+  private async doStreamPersistent(
+    options: Parameters<LanguageModelV2["doStream"]>[0],
+    sessionId: string,
+  ): Promise<Awaited<ReturnType<LanguageModelV2["doStream"]>>> {
+    const warnings: LanguageModelV2CallWarning[] = []
+    const meta: SharedV2ProviderMetadata = { [this.metaKey]: {} }
+
+    const cfg: SessionConfig = {
+      command: this.command,
+      modelId: this.modelId,
+      permissionMode: this.permissionMode,
+      extraArgs: this.extraArgs,
+    }
+
+    const session = await getSession(sessionId, cfg).catch((err: unknown) => {
+      throw err instanceof Error ? err : new Error(stringifyUnknown(err))
+    })
+
+    // if Kilo truncated history (retry, edit), reset session view
+    if (options.prompt.length < session.sentCount) {
+      session.sentCount = 0
+    }
+
+    const isFirst = session.sentCount === 0
+    const content = isFirst
+      ? serializePrompt(options.prompt)
+      : serializeDelta(options.prompt, session.sentCount)
+    const sendable = content.trim().length > 0 ? content : "(continue)"
+
+    const body = { sessionId, sentCount: session.sentCount, bytes: sendable.length }
+
+    const stream = new ReadableStream<LanguageModelV2StreamPart>({
+      start: (controller) => {
+        controller.enqueue({ type: "stream-start", warnings })
+
+        const push = createTurnPush(controller)
+
+        session
+          .turn(sendable, push, options.abortSignal)
+          .then((result) => {
+            push.closeText()
+            push.closeReasoning()
+            session.sentCount = options.prompt.length
+            controller.enqueue({
+              type: "finish",
+              finishReason: result.finish,
+              usage: result.usage,
+              providerMetadata: meta,
+            })
+            controller.close()
+          })
+          .catch((err: unknown) => {
+            controller.enqueue({
+              type: "error",
+              error: err instanceof Error ? err : new Error(stringifyUnknown(err)),
+            })
+            controller.close()
+          })
+      },
+      cancel: () => {
+        // Kilo cancelled the stream — let the session's abort path handle the subprocess
+      },
+    })
+
+    return {
+      stream,
+      request: { body },
+      response: { headers: {} },
+    }
+  }
+
+  private async doStreamStateless(
+    options: Parameters<LanguageModelV2["doStream"]>[0],
+  ): Promise<Awaited<ReturnType<LanguageModelV2["doStream"]>>> {
     const warnings: LanguageModelV2CallWarning[] = []
     const meta: SharedV2ProviderMetadata = { [this.metaKey]: {} }
 
@@ -315,20 +614,23 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
       this.modelId,
       "--permission-mode",
       this.permissionMode,
-      ...this.extraArgs,
+      ...stripFlags(this.extraArgs, [
+        "-p",
+        "--print",
+        "--model",
+        "--permission-mode",
+        "--output-format",
+        "--input-format",
+        "--verbose",
+      ]),
     ]
     const body = { command: this.command, args }
-
-    const env = {
-      ...process.env,
-      CLAUDE_CODE_DISABLE_IDE: "1",
-    }
 
     const proc = Bun.spawn([this.command, ...args], {
       stdout: "pipe",
       stderr: "pipe",
       stdin: "ignore",
-      env,
+      env: { ...process.env, CLAUDE_CODE_DISABLE_IDE: "1" },
     })
 
     let aborted = false
@@ -338,190 +640,83 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
     }
     options.abortSignal?.addEventListener("abort", onAbort, { once: true })
 
-    let textIdx = 0
-    let currentTextId: string | undefined
-    let currentReasoningId: string | undefined
     let finish: LanguageModelV2FinishReason = "unknown"
     let usage = mapUsage(undefined)
     let sawError = false
-    let lastAssistantUsage: ClaudeUsage | undefined
+    let lastUsage: ClaudeUsage | undefined
 
     const stream = new ReadableStream<LanguageModelV2StreamPart>({
       start: (controller) => {
         controller.enqueue({ type: "stream-start", warnings })
 
-        const closeText = () => {
-          if (!currentTextId) return
-          controller.enqueue({ type: "text-end", id: currentTextId })
-          currentTextId = undefined
-        }
-
-        const closeReasoning = () => {
-          if (!currentReasoningId) return
-          controller.enqueue({ type: "reasoning-end", id: currentReasoningId })
-          currentReasoningId = undefined
-        }
-
-        const pushText = (delta: string) => {
-          if (!delta) return
-          closeReasoning()
-          if (!currentTextId) {
-            currentTextId = `txt-${textIdx++}`
-            controller.enqueue({ type: "text-start", id: currentTextId })
-          }
-          controller.enqueue({ type: "text-delta", id: currentTextId, delta })
-        }
-
-        const pushReasoning = (delta: string) => {
-          if (!delta) return
-          closeText()
-          if (!currentReasoningId) {
-            currentReasoningId = `rsn-${textIdx++}`
-            controller.enqueue({ type: "reasoning-start", id: currentReasoningId })
-          }
-          controller.enqueue({ type: "reasoning-delta", id: currentReasoningId, delta })
-        }
-
-        const handleAssistant = (blocks: ClaudeContentBlock[] | undefined) => {
-          if (!blocks) return
-          for (const block of blocks) {
-            switch (block.type) {
-              case "text":
-                if (typeof block.text === "string") pushText(block.text)
-                break
-              case "thinking": {
-                const thought = typeof block.thinking === "string" ? block.thinking : block.text
-                if (typeof thought === "string") pushReasoning(thought)
-                break
-              }
-              case "tool_use": {
-                const formatted = formatToolUse(block)
-                if (formatted) pushReasoning(formatted)
-                break
-              }
-              case "tool_result": {
-                const formatted = formatToolResult(block)
-                if (formatted) pushReasoning(formatted)
-                break
-              }
-            }
-          }
-        }
-
-        const handleUser = (content: ClaudeContentBlock[] | string | undefined) => {
-          if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block.type === "tool_result") {
-                const formatted = formatToolResult(block)
-                if (formatted) pushReasoning(formatted)
-              }
-            }
-          }
-        }
+        const push = createTurnPush(controller)
 
         const handleEvent = (event: ClaudeEvent, raw: string) => {
           if (options.includeRawChunks) {
             controller.enqueue({ type: "raw", rawValue: raw })
           }
-
           switch (event.type) {
             case "system":
               return
             case "assistant": {
               const message = isRecord(event.message) ? event.message : undefined
-              handleAssistant(message?.content as ClaudeContentBlock[] | undefined)
-              const blockUsage = (message?.usage ?? undefined) as ClaudeUsage | undefined
-              if (blockUsage) lastAssistantUsage = blockUsage
+              handleAssistantBlocks(message?.content as ClaudeBlock[] | undefined, push)
+              const u = (message?.usage ?? undefined) as ClaudeUsage | undefined
+              if (u) lastUsage = u
               return
             }
             case "user": {
               const message = isRecord(event.message) ? event.message : undefined
-              handleUser(message?.content as ClaudeContentBlock[] | string | undefined)
+              handleUserBlocks(message?.content as ClaudeBlock[] | string | undefined, push)
               return
             }
             case "result": {
-              const resultEvent = event as Extract<ClaudeEvent, { type: "result" }>
-              finish = mapFinish(resultEvent.subtype, resultEvent.is_error)
-              usage = mapUsage(resultEvent.usage ?? lastAssistantUsage)
+              const r = event as Extract<ClaudeEvent, { type: "result" }>
+              finish = mapFinish(r.subtype, r.is_error)
+              usage = mapUsage(r.usage ?? lastUsage)
               return
             }
           }
         }
 
+        let stderrText = ""
+        drainStderr(proc.stderr as ReadableStream<Uint8Array>, (text) => {
+          stderrText = stderrText ? `${stderrText}\n${text}` : text
+        })
+
         ;(async () => {
-          const reader = proc.stdout.getReader()
-          const decoder = new TextDecoder()
-          let buffer = ""
-
           try {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-
-              buffer += decoder.decode(value, { stream: true })
-              const lines = buffer.split("\n")
-              buffer = lines.pop() ?? ""
-
-              for (const line of lines) {
-                const trimmed = line.trim()
-                if (!trimmed) continue
-
-                try {
-                  handleEvent(JSON.parse(trimmed) as ClaudeEvent, trimmed)
-                } catch (err) {
-                  sawError = true
-                  controller.enqueue({
-                    type: "error",
-                    error: new Error(`Invalid claude stream event: ${stringifyUnknown(err)}`),
-                  })
-                  break
-                }
-              }
-            }
-
-            if (!sawError && buffer.trim()) {
-              try {
-                handleEvent(JSON.parse(buffer.trim()) as ClaudeEvent, buffer.trim())
-              } catch (err) {
-                sawError = true
-                controller.enqueue({
-                  type: "error",
-                  error: new Error(`Invalid claude stream event: ${stringifyUnknown(err)}`),
-                })
-              }
-            }
+            await readNdjson<ClaudeEvent>(
+              proc.stdout as ReadableStream<Uint8Array>,
+              (event, raw) => handleEvent(event, raw),
+              { flushTail: true },
+            )
           } catch (err) {
             if (!aborted) {
               sawError = true
               controller.enqueue({
                 type: "error",
-                error: err instanceof Error ? err : new Error(stringifyUnknown(err)),
+                error: new Error(`Invalid claude stream event: ${stringifyUnknown(err)}`),
               })
             }
           }
 
           const code = await proc.exited
-          const stderr = await new Response(proc.stderr).text()
           options.abortSignal?.removeEventListener("abort", onAbort)
 
-          closeText()
-          closeReasoning()
+          push.closeText()
+          push.closeReasoning()
 
           if (aborted) {
             controller.close()
             return
           }
-
           if (!sawError && code !== 0) {
-            const detail = stderr.trim() || `${this.command} exited with code ${code}`
-            controller.enqueue({
-              type: "error",
-              error: new Error(detail),
-            })
+            const detail = stderrText.trim() || `${this.command} exited with code ${code}`
+            controller.enqueue({ type: "error", error: new Error(detail) })
             controller.close()
             return
           }
-
           if (!sawError) {
             controller.enqueue({
               type: "finish",
@@ -530,7 +725,6 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
               providerMetadata: meta,
             })
           }
-
           controller.close()
         })().catch((err) => {
           controller.enqueue({
@@ -554,13 +748,21 @@ class ClaudeCliLanguageModel implements LanguageModelV2 {
   }
 }
 
+function readSessionId(headers: Record<string, string | undefined> | undefined): string | undefined {
+  if (!headers) return undefined
+  const value = headers["x-kilo-session"] ?? headers["X-Kilo-Session"]
+  if (typeof value !== "string" || !value) return undefined
+  return value
+}
+
 export function createClaudeCli(options: ClaudeCliProviderSettings = {}): ClaudeCliProvider {
   const name = options.name ?? "claude-cli"
   const command = options.command ?? "claude"
   const mode = options.permissionMode ?? "bypassPermissions"
   const extra = options.extraArgs ?? []
+  const persistent = options.persistent ?? true
 
-  const create = (modelId: string) => new ClaudeCliLanguageModel(modelId, name, command, mode, extra)
+  const create = (modelId: string) => new ClaudeCliLanguageModel(modelId, name, command, mode, extra, persistent)
 
   const provider = function (modelId: string) {
     return create(modelId)

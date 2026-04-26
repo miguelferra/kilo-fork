@@ -241,6 +241,11 @@ export namespace LLM {
         ...(isKilo && machineId ? { [HEADER_MACHINEID]: machineId } : {}),
         ...(isKilo ? { [HEADER_TASKID]: input.sessionID } : {}),
         // kilocode_change end
+        // kilocode_change start - pass session id to local-CLI providers for persistent subprocess reuse
+        ...(input.model.providerID === "claude-cli" || input.model.providerID === "gemini-cli"
+          ? { "x-kilo-session": input.sessionID }
+          : {}),
+        // kilocode_change end
         ...input.model.headers,
         ...headers,
       },

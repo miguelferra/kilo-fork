@@ -3,20 +3,46 @@ import {
   type LanguageModelV2CallWarning,
   type LanguageModelV2Content,
   type LanguageModelV2FinishReason,
-  type LanguageModelV2Prompt,
   type LanguageModelV2StreamPart,
   type SharedV2ProviderMetadata,
 } from "@ai-sdk/provider"
+import {
+  createTurnPush,
+  drainStderr,
+  isRecord,
+  readNdjson,
+  serializePrompt,
+  stringifyUnknown,
+  stripFlags,
+} from "./_cli-shared"
+import { runAcpStream, type GeminiApprovalMode } from "./gemini-acp"
 
-// Stateless LanguageModelV2 wrapper around the `gemini` CLI.
+// LanguageModelV2 wrapper around the local `gemini` CLI.
 //
-// v1 design: spawn fresh per request, surface text + thought summaries,
-// map finish reasons and usage. Auth is whatever the local `gemini` binary uses.
+// Two transports:
+//   1) ACP (Agent Client Protocol over stdio, default) — when the call
+//      carries an x-kilo-session header, one long-lived `gemini --acp`
+//      process is kept per (sessionID, modelID). Surfaces real-time
+//      thoughts (agent_thought_chunk), benefits from server-side session
+//      memory, and exposes structured permission requests.
+//   2) stream-json fallback — when no sessionID header is present (or
+//      when transport is explicitly set to "stream-json"), spawn a fresh
+//      `gemini -p ... --output-format stream-json` per call.
+//
+// Auth is whatever the local `gemini` binary uses; the spawned process
+// inherits the parent env so any OAuth credentials configured for the
+// user's gemini CLI work transparently.
+
+export type { GeminiApprovalMode } from "./gemini-acp"
+
+export type GeminiTransport = "acp" | "stream-json"
 
 export interface GeminiCliProviderSettings {
   name?: string
   command?: string
   extraArgs?: string[]
+  approvalMode?: GeminiApprovalMode
+  transport?: GeminiTransport
 }
 
 export interface GeminiCliProvider {
@@ -40,11 +66,30 @@ type GeminiThought = {
   description?: string
 }
 
+type GeminiToolCall = {
+  name?: string
+  arguments?: unknown
+  args?: unknown
+  input?: unknown
+}
+
+type GeminiToolResult = {
+  name?: string
+  output?: unknown
+  result?: unknown
+  is_error?: boolean
+}
+
 type GeminiMessage = {
   role?: "user" | "assistant" | "system"
   content?: string
   delta?: boolean
   thought?: GeminiThought | string
+  tool_call?: GeminiToolCall
+  tool_calls?: GeminiToolCall[]
+  function_call?: GeminiToolCall
+  tool_result?: GeminiToolResult
+  function_response?: GeminiToolResult
 }
 
 type GeminiEvent =
@@ -53,20 +98,9 @@ type GeminiEvent =
   | { type: "result"; status?: string; stats?: GeminiStats; timestamp?: string; error?: unknown }
   | { type: "error"; error?: unknown; message?: string }
   | { type: "thought"; value?: GeminiThought }
+  | { type: "tool_call"; value?: GeminiToolCall }
+  | { type: "tool_result"; value?: GeminiToolResult }
   | { type: string; [key: string]: unknown }
-
-function stringifyUnknown(input: unknown): string {
-  if (typeof input === "string") return input
-  if (input instanceof Error) return input.message
-  if (input && typeof input === "object" && "message" in input && typeof input.message === "string") {
-    return input.message
-  }
-  try {
-    return JSON.stringify(input)
-  } catch {
-    return String(input)
-  }
-}
 
 function formatThought(value: GeminiThought | undefined) {
   if (!value) return ""
@@ -77,88 +111,21 @@ function formatThought(value: GeminiThought | undefined) {
   return description ?? ""
 }
 
-function formatToolOutput(output: {
-  type: "text" | "error-text" | "json" | "error-json" | "content"
-  value: unknown
-}) {
-  switch (output.type) {
-    case "text":
-    case "error-text":
-      return String(output.value)
-    case "json":
-    case "error-json":
-    case "content":
-      return stringifyUnknown(output.value)
-  }
+function formatToolCall(call: GeminiToolCall | undefined) {
+  if (!call) return ""
+  const name = typeof call.name === "string" ? call.name : "unknown"
+  const args = call.arguments ?? call.args ?? call.input
+  const argText = args !== undefined ? stringifyUnknown(args) : ""
+  return argText ? `[Tool ${name}] ${argText}` : `[Tool ${name}]`
 }
 
-function formatAssistantContent(parts: Array<{ type: string; [key: string]: unknown }>) {
-  const lines: string[] = []
-  for (const part of parts) {
-    switch (part.type) {
-      case "text":
-        if (typeof part.text === "string" && part.text.trim()) lines.push(part.text)
-        break
-      case "reasoning":
-        if (typeof part.text === "string" && part.text.trim()) lines.push(`[Reasoning]\n${part.text}`)
-        break
-      case "tool-call":
-        lines.push(`[Tool ${String(part.toolName ?? "unknown")}] ${stringifyUnknown(part.input)}`)
-        break
-    }
-  }
-  return lines.join("\n\n").trim()
-}
-
-function serializePrompt(prompt: LanguageModelV2Prompt) {
-  const blocks: string[] = []
-
-  for (const message of prompt) {
-    switch (message.role) {
-      case "system":
-        if (message.content.trim()) blocks.push(`System:\n${message.content}`)
-        break
-
-      case "user": {
-        const content = message.content
-          .map((part) => {
-            switch (part.type) {
-              case "text":
-                return part.text
-              case "file":
-                return `[Attachment omitted: ${part.filename ?? part.mediaType}]`
-            }
-          })
-          .filter((item) => item.trim())
-          .join("\n")
-
-        if (content) blocks.push(`User:\n${content}`)
-        break
-      }
-
-      case "assistant": {
-        const content = formatAssistantContent(
-          message.content as unknown as Array<{ type: string; [key: string]: unknown }>,
-        )
-        if (content) blocks.push(`Assistant:\n${content}`)
-        break
-      }
-
-      case "tool": {
-        const content = message.content
-          .map((part) => {
-            const body = formatToolOutput(part.output)
-            return `Tool ${part.toolName} (${part.toolCallId}):\n${body}`
-          })
-          .join("\n\n")
-
-        if (content) blocks.push(content)
-        break
-      }
-    }
-  }
-
-  return blocks.join("\n\n")
+function formatToolResult(result: GeminiToolResult | undefined) {
+  if (!result) return ""
+  const name = typeof result.name === "string" ? result.name : "?"
+  const body = result.output ?? result.result
+  const text = body !== undefined ? stringifyUnknown(body) : ""
+  const prefix = result.is_error ? "Tool error" : "Tool result"
+  return text ? `[${prefix} ${name}]\n${text}` : `[${prefix} ${name}]`
 }
 
 function mapFinish(status: string | undefined): LanguageModelV2FinishReason {
@@ -193,10 +160,6 @@ function mapUsage(stats: GeminiStats | undefined) {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null
-}
-
 class GeminiCliLanguageModel implements LanguageModelV2 {
   readonly specificationVersion = "v2"
   readonly supportsStructuredOutputs = false
@@ -206,6 +169,8 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
     private readonly providerName: string,
     private readonly command: string,
     private readonly extraArgs: string[],
+    private readonly approvalMode: GeminiApprovalMode,
+    private readonly transport: GeminiTransport,
   ) {}
 
   get provider(): string {
@@ -229,7 +194,7 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
     const content: LanguageModelV2Content[] = []
     let text = ""
     let reasoning = ""
-    let finish: LanguageModelV2FinishReason = "unknown"
+    let finish: LanguageModelV2FinishReason = "stop"
     let meta: SharedV2ProviderMetadata = { [this.metaKey]: {} }
     let usage: Awaited<ReturnType<LanguageModelV2["doGenerate"]>>["usage"] = {
       inputTokens: undefined,
@@ -289,11 +254,43 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
   async doStream(
     options: Parameters<LanguageModelV2["doStream"]>[0],
   ): Promise<Awaited<ReturnType<LanguageModelV2["doStream"]>>> {
+    const sessionId = readSessionId(options.headers)
+    if (this.transport === "acp" && sessionId) {
+      return runAcpStream({
+        options,
+        kiloSessionId: sessionId,
+        command: this.command,
+        modelId: this.modelId,
+        approvalMode: this.approvalMode,
+        extraArgs: this.extraArgs,
+        metaKey: this.metaKey,
+      })
+    }
+
     const warnings: LanguageModelV2CallWarning[] = []
     const meta: SharedV2ProviderMetadata = { [this.metaKey]: {} }
 
     const prompt = serializePrompt(options.prompt)
-    const args = ["-p", prompt, "--output-format", "stream-json", "-m", this.modelId, ...this.extraArgs]
+    const args = [
+      "-p",
+      prompt,
+      "--output-format",
+      "stream-json",
+      "-m",
+      this.modelId,
+      "--approval-mode",
+      this.approvalMode,
+      ...stripFlags(this.extraArgs, [
+        "-p",
+        "--prompt",
+        "-m",
+        "--model",
+        "--output-format",
+        "--approval-mode",
+        "-y",
+        "--yolo",
+      ]),
+    ]
     const body = { command: this.command, args }
 
     const proc = Bun.spawn([this.command, ...args], {
@@ -309,10 +306,9 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
     }
     options.abortSignal?.addEventListener("abort", onAbort, { once: true })
 
-    let textIdx = 0
-    let currentTextId: string | undefined
-    let currentReasoningId: string | undefined
-    let finish: LanguageModelV2FinishReason = "unknown"
+    // Default to "stop" so a clean exit without an explicit `result` event
+    // doesn't leave us reporting `unknown`. Real result events overwrite this.
+    let finish: LanguageModelV2FinishReason = "stop"
     let usage = mapUsage(undefined)
     let sawError = false
 
@@ -320,46 +316,35 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
       start: (controller) => {
         controller.enqueue({ type: "stream-start", warnings })
 
-        const closeText = () => {
-          if (!currentTextId) return
-          controller.enqueue({ type: "text-end", id: currentTextId })
-          currentTextId = undefined
-        }
-
-        const closeReasoning = () => {
-          if (!currentReasoningId) return
-          controller.enqueue({ type: "reasoning-end", id: currentReasoningId })
-          currentReasoningId = undefined
-        }
-
-        const pushText = (delta: string) => {
-          if (!delta) return
-          closeReasoning()
-          if (!currentTextId) {
-            currentTextId = `txt-${textIdx++}`
-            controller.enqueue({ type: "text-start", id: currentTextId })
-          }
-          controller.enqueue({ type: "text-delta", id: currentTextId, delta })
-        }
-
-        const pushReasoning = (delta: string) => {
-          if (!delta) return
-          closeText()
-          if (!currentReasoningId) {
-            currentReasoningId = `rsn-${textIdx++}`
-            controller.enqueue({ type: "reasoning-start", id: currentReasoningId })
-          }
-          controller.enqueue({ type: "reasoning-delta", id: currentReasoningId, delta })
-        }
+        const push = createTurnPush(controller)
 
         const handleMessage = (msg: GeminiMessage) => {
           if (msg.role && msg.role !== "assistant") return
           if (msg.delta === false) return
+
           if (isRecord(msg.thought) || typeof msg.thought === "string") {
             const thought = typeof msg.thought === "string" ? msg.thought : formatThought(msg.thought)
-            if (thought) pushReasoning(thought)
+            if (thought) push.pushReasoning(thought)
           }
-          if (typeof msg.content === "string") pushText(msg.content)
+
+          // Fold any tool activity into the reasoning channel so the user
+          // can see what the gemini CLI is doing internally — Kilo never
+          // executes these tools itself.
+          const toolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
+          if (msg.tool_call) toolCalls.push(msg.tool_call)
+          if (msg.function_call) toolCalls.push(msg.function_call)
+          for (const call of toolCalls) {
+            const text = formatToolCall(call)
+            if (text) push.pushReasoning(text)
+          }
+
+          const toolResult = msg.tool_result ?? msg.function_response
+          if (toolResult) {
+            const text = formatToolResult(toolResult)
+            if (text) push.pushReasoning(text)
+          }
+
+          if (typeof msg.content === "string") push.pushText(msg.content)
         }
 
         const handleEvent = (event: GeminiEvent, raw: string) => {
@@ -375,7 +360,17 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
               return
             case "thought": {
               const thought = formatThought(isRecord(event.value) ? (event.value as GeminiThought) : undefined)
-              if (thought) pushReasoning(thought)
+              if (thought) push.pushReasoning(thought)
+              return
+            }
+            case "tool_call": {
+              const text = formatToolCall(isRecord(event.value) ? (event.value as GeminiToolCall) : undefined)
+              if (text) push.pushReasoning(text)
+              return
+            }
+            case "tool_result": {
+              const text = formatToolResult(isRecord(event.value) ? (event.value as GeminiToolResult) : undefined)
+              if (text) push.pushReasoning(text)
               return
             }
             case "result": {
@@ -403,64 +398,33 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
           }
         }
 
+        let stderrText = ""
+        drainStderr(proc.stderr as ReadableStream<Uint8Array>, (text) => {
+          stderrText = stderrText ? `${stderrText}\n${text}` : text
+        })
+
         ;(async () => {
-          const reader = proc.stdout.getReader()
-          const decoder = new TextDecoder()
-          let buffer = ""
-
           try {
-            while (true) {
-              const { done, value } = await reader.read()
-              if (done) break
-
-              buffer += decoder.decode(value, { stream: true })
-              const lines = buffer.split("\n")
-              buffer = lines.pop() ?? ""
-
-              for (const line of lines) {
-                const trimmed = line.trim()
-                if (!trimmed) continue
-
-                try {
-                  handleEvent(JSON.parse(trimmed) as GeminiEvent, trimmed)
-                } catch (err) {
-                  sawError = true
-                  controller.enqueue({
-                    type: "error",
-                    error: new Error(`Invalid gemini stream event: ${stringifyUnknown(err)}`),
-                  })
-                  break
-                }
-              }
-            }
-
-            if (!sawError && buffer.trim()) {
-              try {
-                handleEvent(JSON.parse(buffer.trim()) as GeminiEvent, buffer.trim())
-              } catch (err) {
-                sawError = true
-                controller.enqueue({
-                  type: "error",
-                  error: new Error(`Invalid gemini stream event: ${stringifyUnknown(err)}`),
-                })
-              }
-            }
+            await readNdjson<GeminiEvent>(
+              proc.stdout as ReadableStream<Uint8Array>,
+              (event, raw) => handleEvent(event, raw),
+              { flushTail: true },
+            )
           } catch (err) {
             if (!aborted) {
               sawError = true
               controller.enqueue({
                 type: "error",
-                error: err instanceof Error ? err : new Error(stringifyUnknown(err)),
+                error: new Error(`Invalid gemini stream event: ${stringifyUnknown(err)}`),
               })
             }
           }
 
           const code = await proc.exited
-          const stderr = await new Response(proc.stderr).text()
           options.abortSignal?.removeEventListener("abort", onAbort)
 
-          closeText()
-          closeReasoning()
+          push.closeText()
+          push.closeReasoning()
 
           if (aborted) {
             controller.close()
@@ -468,7 +432,7 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
           }
 
           if (!sawError && code !== 0) {
-            const detail = stderr.trim() || `${this.command} exited with code ${code}`
+            const detail = stderrText.trim() || `${this.command} exited with code ${code}`
             controller.enqueue({
               type: "error",
               error: new Error(detail),
@@ -509,12 +473,24 @@ class GeminiCliLanguageModel implements LanguageModelV2 {
   }
 }
 
+function readSessionId(headers: Record<string, string | undefined> | undefined): string | undefined {
+  if (!headers) return undefined
+  const value = headers["x-kilo-session"] ?? headers["X-Kilo-Session"]
+  if (typeof value !== "string" || !value) return undefined
+  return value
+}
+
 export function createGeminiCli(options: GeminiCliProviderSettings = {}): GeminiCliProvider {
   const name = options.name ?? "gemini-cli"
   const command = options.command ?? "gemini"
   const extra = options.extraArgs ?? []
+  // Default to `yolo` so the spawned subprocess never blocks waiting on stdin
+  // for an approval prompt — Kilo handles user-facing permissions upstream.
+  const approval = options.approvalMode ?? "yolo"
+  const transport: GeminiTransport = options.transport ?? "acp"
 
-  const create = (modelId: string) => new GeminiCliLanguageModel(modelId, name, command, extra)
+  const create = (modelId: string) =>
+    new GeminiCliLanguageModel(modelId, name, command, extra, approval, transport)
 
   const provider = function (modelId: string) {
     return create(modelId)
